@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Lockfiles (optional - uncomment if you want to track)
+# bun.lock
+
+# Build output
+dist/
+build/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Logs
+logs/
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# TypeScript cache
+*.tsbuildinfo

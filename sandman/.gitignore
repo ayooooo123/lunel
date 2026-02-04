@@ -1,0 +1,38 @@
+# Binaries
+sandman
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of go coverage
+*.out
+
+# Go workspace
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# State file (runtime generated)
+sandman.json
+sandman.json.tmp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# VM images (don't commit these)
+*.ext4
+*.bin
