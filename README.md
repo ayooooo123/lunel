@@ -1,6 +1,4 @@
-![Lunel](https://avatars.githubusercontent.com/u/238702748)
-
-# Lunel
+![Lunel](https://delhi.lunel.dev/og/og.png)
 
 AI-powered mobile IDE and cloud development platform. Code on your phone, run on your machine or in secure cloud sandboxes.
 
