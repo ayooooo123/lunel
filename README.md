@@ -1,6 +1,6 @@
 # Lunel
 
-Cloud development sandbox platform.
+AI powered cloud development sandbox platform.
 
 ## Structure
 
