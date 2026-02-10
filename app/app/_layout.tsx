@@ -2,7 +2,6 @@ import { AuthProvider } from "@/contexts/AuthContext";
 import { ConnectionProvider } from "@/contexts/ConnectionContext";
 import { EditorProvider } from "@/contexts/EditorContext";
 import { ThemeProvider, useTheme } from "@/contexts/ThemeContext";
-import { startTcpServer } from "@/lib/tcpServer";
 import { PluginProvider } from "@/plugins";
 import "@/plugins/load"; // Load all plugins
 // Sans fonts
@@ -168,18 +167,8 @@ function RootLayoutContent() {
   });
 
   useEffect(() => {
-    async function doAsyncStuff() {
-      try {
-        // Start TCP server on port 8888
-        await startTcpServer();
-      } catch (e) {
-        console.warn(e);
-      } finally {
-        setIsReady(true);
-      }
-    }
-
-    doAsyncStuff();
+    // Proxy servers start dynamically when CLI reports open ports
+    setIsReady(true);
   }, []);
 
   useEffect(() => {
