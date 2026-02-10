@@ -12,7 +12,9 @@ import { spawn, ChildProcess, execSync } from "child_process";
 import { createServer, createConnection, Socket } from "net";
 
 const PROXY_URL = process.env.LUNEL_PROXY_URL || "https://gateway.lunel.dev";
-const VERSION = "0.1.3";
+import { createRequire } from "module";
+const __require = createRequire(import.meta.url);
+const VERSION = (__require("../package.json") as { version: string }).version;
 
 // Root directory - sandbox all file operations to this
 const ROOT_DIR = process.cwd();
