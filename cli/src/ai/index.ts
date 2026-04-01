@@ -17,7 +17,8 @@ export class AiManager {
       this.tryInit("codex"),
     ]);
     if (this._available.length === 0) {
-      throw new Error("No AI backend could be started. Ensure opencode or codex is installed.");
+      console.warn("[ai] No AI backends available. CLI will continue without AI features.");
+      return;
     }
     if (DEBUG_MODE) {
       console.log(`[ai] Available backends: ${this._available.join(", ")}`);
