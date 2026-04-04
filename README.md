@@ -1,9 +1,9 @@
 <div align="center">
   <a href="https://lunel.dev">
     <picture>
-      <source srcset="https://lunel.dev/img/github/github-main.png" media="(prefers-color-scheme: dark)" width="600">
-      <source srcset="./github-main-light.png" media="(prefers-color-scheme: light)" width="600">
-      <img src="https://lunel.dev/img/github/github-main.png" alt="Lunel">
+      <source srcset="https://lunel.dev/img/github/github-main-dark.png" media="(prefers-color-scheme: dark)" width="600">
+      <source srcset="https://lunel.dev/img/github/github-main-light.png" media="(prefers-color-scheme: light)" width="600">
+      <img src="https://lunel.dev/img/github/github-main-dark.png" alt="Lunel">
     </picture>
   </a>
 </div><br />
