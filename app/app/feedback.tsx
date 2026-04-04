@@ -1,7 +1,8 @@
 import { useTheme } from "@/contexts/ThemeContext";
-import { Check, ChevronLeft, Star } from "lucide-react-native";
+import PluginHeader, { usePluginHeaderHeight } from "@/components/PluginHeader";
+import { Check, Star } from "lucide-react-native";
 import * as Haptics from "expo-haptics";
-import { useRouter } from "expo-router";
+import { Stack, useRouter } from "expo-router";
 import React, { useState } from "react";
 import {
   ActivityIndicator,
@@ -12,7 +13,6 @@ import {
   TouchableOpacity,
   View,
 } from "react-native";
-import { SafeAreaView } from "react-native-safe-area-context";
 
 const FEEDBACK_ENDPOINT = "https://internal-api.lunel.dev/app/feedback";
 
@@ -40,13 +40,13 @@ function RatingStars({
               {
                 backgroundColor: isActive ? colors.accent.default : colors.bg.raised,
                 borderColor: isActive ? colors.accent.default : colors.bg.raised,
-                borderRadius: radius.lg,
+                borderRadius: 10,
                 marginRight: value === 5 ? 0 : spacing[2],
               },
             ]}
           >
             <Star
-              size={20}
+              size={18}
               strokeWidth={2}
               color={isActive ? colors.bg.base : colors.fg.muted}
               fill={isActive ? colors.bg.base : "transparent"}
@@ -59,8 +59,9 @@ function RatingStars({
 }
 
 export default function FeedbackPage() {
-  const { colors, fonts, radius, spacing } = useTheme();
+  const { colors, fonts, radius, spacing, typography } = useTheme();
   const router = useRouter();
+  const headerHeight = usePluginHeaderHeight();
   const [email, setEmail] = useState("");
   const [content, setContent] = useState("");
   const [rating, setRating] = useState(0);
@@ -135,43 +136,9 @@ export default function FeedbackPage() {
   }
 
   return (
-    <SafeAreaView style={[styles.container, { backgroundColor: colors.bg.base }]} edges={["top"]}>
-      <View style={[styles.header, { backgroundColor: colors.bg.base }]}>
-        <TouchableOpacity
-          onPress={() => {
-            void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
-            router.back();
-          }}
-          style={[
-            styles.backButton,
-            {
-              borderRadius: radius.full,
-              backgroundColor: colors.bg.raised,
-              borderColor: colors.border.secondary,
-              borderWidth: 0.5,
-            },
-          ]}
-          hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
-        >
-          <ChevronLeft size={24} color={colors.fg.default} strokeWidth={2} />
-        </TouchableOpacity>
-        <View
-          style={[
-            styles.titlePill,
-            {
-              borderRadius: radius.full,
-              backgroundColor: colors.bg.raised,
-              borderColor: colors.border.secondary,
-              borderWidth: 0.5,
-            },
-          ]}
-        >
-          <Text style={[styles.headerTitle, { color: colors.fg.default, fontFamily: fonts.sans.semibold }]}>
-            Feedback
-          </Text>
-        </View>
-        <View style={[styles.placeholder, { opacity: 0 }]} />
-      </View>
+    <View style={[styles.container, { backgroundColor: colors.bg.base, paddingTop: headerHeight }]}>
+      <Stack.Screen options={{ headerShown: false }} />
+      <PluginHeader title="Feedback" colors={colors} onBack={() => router.back()} />
 
       {isSent ? (
         <View style={styles.sentState}>
@@ -206,7 +173,7 @@ export default function FeedbackPage() {
                   {
                     backgroundColor: colors.bg.raised,
                     borderColor: colors.bg.raised,
-                    borderRadius: radius.lg,
+                    borderRadius: 10,
                   },
                 ]}
               >
@@ -230,7 +197,7 @@ export default function FeedbackPage() {
                   {
                     backgroundColor: colors.bg.raised,
                     borderColor: colors.bg.raised,
-                    borderRadius: radius.lg,
+                    borderRadius: 10,
                   },
                 ]}
               >
@@ -269,7 +236,7 @@ export default function FeedbackPage() {
               {
                 backgroundColor: canSend ? colors.accent.default : colors.bg.raised,
                 borderColor: canSend ? colors.accent.default : colors.bg.raised,
-                borderRadius: radius.lg,
+                borderRadius: 10,
                 marginHorizontal: 16,
                 marginTop: spacing[4],
                 opacity: isSubmitting ? 0.8 : 1,
@@ -285,6 +252,7 @@ export default function FeedbackPage() {
                   {
                     color: canSend ? colors.bg.base : colors.fg.subtle,
                     fontFamily: fonts.sans.semibold,
+                    fontSize: typography.body,
                   },
                 ]}
               >
@@ -296,40 +264,13 @@ export default function FeedbackPage() {
           <View style={{ height: spacing[8] }} />
         </ScrollView>
       )}
-    </SafeAreaView>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
   container: {
     flex: 1,
-  },
-  header: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    paddingHorizontal: 12,
-    height: 64,
-    paddingBottom: 10,
-  },
-  backButton: {
-    width: 45,
-    height: 45,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  titlePill: {
-    minHeight: 45,
-    justifyContent: "center",
-    alignItems: "center",
-    paddingHorizontal: 20,
-  },
-  headerTitle: {
-    fontSize: 16,
-  },
-  placeholder: {
-    width: 45,
-    height: 45,
   },
   content: {
     flex: 1,
@@ -341,15 +282,15 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   introTitle: {
-    fontSize: 16,
+    fontSize: 15,
   },
   fieldGroup: {
     marginTop: 10,
   },
   fieldCard: {
     borderWidth: 1,
-    paddingHorizontal: 16,
-    paddingVertical: 14,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
   },
   input: {
     fontSize: 15,
@@ -366,8 +307,8 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   starButton: {
-    width: 44,
-    height: 44,
+    width: 36,
+    height: 36,
     alignItems: "center",
     justifyContent: "center",
     borderWidth: 1,
@@ -378,14 +319,12 @@ const styles = StyleSheet.create({
     marginTop: 14,
   },
   sendButton: {
-    minHeight: 52,
+    minHeight: 40,
     alignItems: "center",
     justifyContent: "center",
     borderWidth: 1,
   },
-  sendButtonLabel: {
-    fontSize: 16,
-  },
+  sendButtonLabel: {},
   sentState: {
     flex: 1,
     alignItems: "center",
