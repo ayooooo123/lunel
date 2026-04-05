@@ -46,6 +46,7 @@ import Animated, {
 import { useReanimatedKeyboardAnimation } from "react-native-keyboard-controller";
 import * as Clipboard from "expo-clipboard";
 import * as FileSystem from "expo-file-system/legacy";
+import * as Haptics from "expo-haptics";
 import * as ImagePicker from "expo-image-picker";
 import { Audio } from "expo-av";
 import Svg, { Path } from "react-native-svg";
@@ -785,8 +786,8 @@ function PermissionSheet({
               styles.sheetContainer,
               {
                 backgroundColor: colors.bg.raised,
-                borderTopLeftRadius: radius['2xl'],
-                borderTopRightRadius: radius['2xl'],
+                borderTopLeftRadius: 20,
+                borderTopRightRadius: 20,
                 minHeight: 320,
                 maxHeight: SCREEN_HEIGHT * 0.62,
               },
@@ -1127,8 +1128,8 @@ function BackendPickerDialog({
     description: string;
     disabled?: boolean;
   }> = [
-    { backend: "opencode", label: "OpenCode", description: "The open source AI coding agent" },
     { backend: "codex", label: "Codex", description: "OpenAI Codex CLI" },
+    { backend: "opencode", label: "OpenCode", description: "The open source AI coding agent" },
     { label: "Claude Code", description: "Coming soon", disabled: true },
   ];
   const text = {
@@ -1147,8 +1148,8 @@ function BackendPickerDialog({
               styles.sheetContainer,
               {
                 backgroundColor: colors.bg.raised,
-                borderTopLeftRadius: radius['2xl'],
-                borderTopRightRadius: radius['2xl'],
+                borderTopLeftRadius: 20,
+                borderTopRightRadius: 20,
                 height: "36%",
               },
               sheetAnimatedStyle,
@@ -1156,12 +1157,15 @@ function BackendPickerDialog({
           >
             <View style={styles.sheetHeader}>
               <View style={{ flex: 1 }}>
-                <Text style={{ color: colors.fg.default, fontSize: 20, fontFamily: fonts.sans.semibold }}>
+                <Text style={{ color: colors.fg.default, fontSize: 18, fontFamily: fonts.sans.semibold }}>
                   {text.header}
                 </Text>
               </View>
               <TouchableOpacity
-                onPress={onClose}
+                onPress={() => {
+                  void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                  onClose();
+                }}
                 activeOpacity={0.7}
                 style={{ width: 32, height: 32, borderRadius: 16, backgroundColor: colors.bg.base, alignItems: "center", justifyContent: "center" }}
               >
@@ -1169,7 +1173,7 @@ function BackendPickerDialog({
               </TouchableOpacity>
             </View>
 
-            <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingHorizontal: 14, paddingBottom: 18, gap: 6 }} keyboardDismissMode="on-drag">
+            <ScrollView style={{ flex: 1, marginBottom: 20 }} contentContainerStyle={{ paddingHorizontal: 14, paddingBottom: 18, gap: 6 }} keyboardDismissMode="on-drag">
               {options.map(({ backend, label, description, disabled }) => (
                 <TouchableOpacity
                   key={backend ?? label}
@@ -1180,7 +1184,7 @@ function BackendPickerDialog({
                   disabled={disabled}
                   style={[styles.backendOption, {
                     backgroundColor: disabled ? colors.bg.base : colors.bg.raised,
-                    borderRadius: radius.xl,
+                    borderRadius: 10,
                     opacity: disabled ? 0.55 : 1,
                   }]}
                 >
@@ -1285,20 +1289,24 @@ function ConfigureSheet({
           <Pressable style={{ flex: 1 }} onPress={onClose} />
         </Animated.View>
         <Animated.View
-          style={[
-            styles.sheetContainer,
-            {
-              backgroundColor: colors.bg.raised,
-              borderTopLeftRadius: radius['2xl'],
-              borderTopRightRadius: radius['2xl'],
-            },
-            sheetAnimatedStyle,
-          ]}
+            style={[
+              styles.sheetContainer,
+              {
+                backgroundColor: colors.bg.raised,
+                borderTopLeftRadius: 20,
+                borderTopRightRadius: 20,
+                height: "42%",
+              },
+              sheetAnimatedStyle,
+            ]}
         >
           <View style={styles.sheetHeader}>
-            <Text style={{ flex: 1, color: colors.fg.default, fontSize: 20, fontFamily: fonts.sans.semibold }}>Configure</Text>
+            <Text style={{ flex: 1, color: colors.fg.default, fontSize: 18, fontFamily: fonts.sans.semibold }}>Configure</Text>
             <TouchableOpacity
-              onPress={onClose}
+              onPress={() => {
+                void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+                onClose();
+              }}
               activeOpacity={0.7}
               style={{ width: 32, height: 32, borderRadius: 16, backgroundColor: colors.bg.base, alignItems: "center", justifyContent: "center" }}
             >
@@ -1306,10 +1314,14 @@ function ConfigureSheet({
             </TouchableOpacity>
           </View>
 
-          <ScrollView style={{ flex: 1 }} contentContainerStyle={{ paddingBottom: 20, paddingHorizontal: 8, gap: 18 }} keyboardDismissMode="on-drag">
+          <ScrollView
+            style={{ flex: 1, marginBottom: 20 }}
+            contentContainerStyle={{ paddingHorizontal: 14, paddingBottom: 18, gap: 10 }}
+            keyboardDismissMode="on-drag"
+          >
             {backend === "opencode" && modeOptions.length > 0 ? (
-              <View>
-                <Text style={{ color: colors.fg.muted, fontSize: 12, fontFamily: fonts.sans.semibold, marginBottom: 8, paddingHorizontal: 8 }}>
+              <View style={{ gap: 6 }}>
+                <Text style={{ color: colors.fg.muted, fontSize: 12, fontFamily: fonts.sans.semibold, paddingHorizontal: 2 }}>
                   Mode
                 </Text>
                 {modeOptions.map((option) => {
@@ -1319,7 +1331,10 @@ function ConfigureSheet({
                       key={option.id}
                       style={[
                         styles.sheetRow,
-                        selected && { backgroundColor: colors.bg.raised, borderRadius: radius.lg },
+                        {
+                          backgroundColor: selected ? colors.bg.base : colors.bg.raised,
+                          borderRadius: 10,
+                        },
                       ]}
                       onPress={() => onSelectMode(option.id)}
                       activeOpacity={0.7}
@@ -1329,21 +1344,20 @@ function ConfigureSheet({
                         style={{
                           flex: 1,
                           color: colors.fg.default,
-                          fontSize: 15,
-                          fontFamily: selected ? fonts.sans.semibold : fonts.sans.regular,
+                          fontSize: 14,
+                          fontFamily: fonts.sans.medium,
                         }}
                       >
                         {option.name}
                       </Text>
-                      {selected && <Check size={16} color={colors.fg.default} strokeWidth={2.8} />}
                     </TouchableOpacity>
                   );
                 })}
               </View>
             ) : null}
 
-            <View>
-              <Text style={{ color: colors.fg.muted, fontSize: 12, fontFamily: fonts.sans.semibold, marginBottom: 8, paddingHorizontal: 8 }}>
+            <View style={{ gap: 6 }}>
+              <Text style={{ color: colors.fg.muted, fontSize: 12, fontFamily: fonts.sans.semibold, paddingHorizontal: 2 }}>
                 Model
               </Text>
               {modelOptions.length > 0 ? modelOptions.map((option) => {
@@ -1353,7 +1367,10 @@ function ConfigureSheet({
                     key={option.id}
                     style={[
                       styles.sheetRow,
-                      selected && { backgroundColor: colors.bg.raised, borderRadius: radius.lg },
+                      {
+                        backgroundColor: selected ? colors.bg.base : colors.bg.raised,
+                        borderRadius: 10,
+                      },
                     ]}
                     onPress={() => onSelectModel(option.id)}
                     activeOpacity={0.7}
@@ -1363,18 +1380,26 @@ function ConfigureSheet({
                       style={{
                         flex: 1,
                         color: colors.fg.default,
-                        fontSize: 15,
-                        fontFamily: selected ? fonts.sans.semibold : fonts.sans.regular,
+                        fontSize: 14,
+                        fontFamily: fonts.sans.medium,
                       }}
                     >
                       {option.name}
                     </Text>
-                    {selected && <Check size={16} color={colors.fg.default} strokeWidth={2.8} />}
                   </TouchableOpacity>
                 );
               }) : (
-                <View style={styles.sheetRow}>
-                  <Text style={{ color: colors.fg.muted, fontSize: 14, fontFamily: fonts.sans.regular }}>
+                <View
+                  style={[
+                    styles.backendOption,
+                    {
+                      backgroundColor: colors.bg.base,
+                      borderRadius: 10,
+                      opacity: 0.7,
+                    },
+                  ]}
+                >
+                  <Text style={{ color: colors.fg.muted, fontSize: 12, fontFamily: fonts.sans.regular }}>
                     {backend === "codex" ? "Auto" : "No models available"}
                   </Text>
                 </View>
@@ -3251,7 +3276,8 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   backendOption: {
-    padding: 14,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
   },
 
   // Tab styles
@@ -3594,9 +3620,8 @@ const styles = StyleSheet.create({
   sheetRow: {
     flexDirection: "row",
     alignItems: "center",
-    paddingHorizontal: 16,
-    paddingVertical: 14,
-    marginBottom: 4,
+    paddingHorizontal: 14,
+    paddingVertical: 10,
     gap: 10,
   },
 
