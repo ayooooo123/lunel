@@ -3307,7 +3307,7 @@ const selectedModelNameFull = modelOptions.find((m) => m.id === selectedModel)?.
   }, [activeTab, closeTab]);
 
   const hasContent = listData.length > 0;
-  const messagesBottomInset = composerHeight + 16;
+  const messagesBottomInset = 16;
 
   useEffect(() => {
     if (!hasContent) return;
@@ -4166,10 +4166,6 @@ const styles = StyleSheet.create({
 
   // Input styles
   inputContainer: {
-    position: "absolute",
-    bottom: 0,
-    left: 0,
-    right: 0,
     marginHorizontal: 8,
     marginBottom: 8,
     paddingHorizontal: 10,

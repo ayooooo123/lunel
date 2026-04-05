@@ -138,7 +138,7 @@ export default function WorkspaceScreen() {
           <View
             style={{
               minWidth: 160,
-              borderRadius: 12,
+              borderRadius: 10,
               paddingHorizontal: 16,
               paddingVertical: 14,
               backgroundColor: colors.bg.raised,
@@ -149,7 +149,7 @@ export default function WorkspaceScreen() {
             }}
           >
             <View style={{ width: 20, height: 20 }}>
-              <Loading color={colors.accent.default} />
+              <Loading color={colors.fg.default} />
             </View>
             <Text
               style={{
