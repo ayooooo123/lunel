@@ -1,6 +1,7 @@
 import { AppSettingsProvider, useAppSettings } from "@/contexts/AppSettingsContext";
 import { ConnectionProvider } from "@/contexts/ConnectionContext";
 import { EditorProvider } from "@/contexts/EditorContext";
+import { ReviewPromptProvider } from "@/contexts/ReviewPromptContext";
 import { SessionRegistryProvider } from "@/contexts/SessionRegistry";
 import { ThemeProvider, useTheme } from "@/contexts/ThemeContext";
 import { PluginProvider } from "@/plugins";
@@ -316,13 +317,15 @@ function RootLayout() {
       <ConnectionProvider>
         <ThemeProvider>
           <AppSettingsProvider>
-            <EditorProvider>
-              <PluginProvider>
-                <SessionRegistryProvider>
-                  <RootLayoutContent />
-                </SessionRegistryProvider>
-              </PluginProvider>
-            </EditorProvider>
+            <ReviewPromptProvider>
+              <EditorProvider>
+                <PluginProvider>
+                  <SessionRegistryProvider>
+                    <RootLayoutContent />
+                  </SessionRegistryProvider>
+                </PluginProvider>
+              </EditorProvider>
+            </ReviewPromptProvider>
           </AppSettingsProvider>
         </ThemeProvider>
       </ConnectionProvider>

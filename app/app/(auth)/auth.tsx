@@ -13,8 +13,31 @@ import Svg, { Path } from "react-native-svg";
 const TABLET_BREAKPOINT = 768;
 const TERMS_URL = "https://app.lunel.dev/terms";
 const PRIVACY_URL = "https://app.lunel.dev/privacy";
+const UPDATE_CHECK_URL = "https://internal-api.lunel.dev/updateNeeded?version=1.0.1";
 const { height: SCREEN_HEIGHT } = Dimensions.get("window");
 const LOGO_SOURCE = require("@/assets/images/icon.png");
+
+type UpdateCheckResponse = {
+  updateNeeded: true;
+  ios: string;
+  android: string;
+};
+
+function isUpdateCheckResponse(value: unknown): value is UpdateCheckResponse {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    candidate.updateNeeded === true &&
+    typeof candidate.ios === "string" &&
+    typeof candidate.android === "string"
+  );
+}
+
+function getPreferredUpdateUrl(update: UpdateCheckResponse): string {
+  if (Platform.OS === "ios") return update.ios;
+  if (Platform.OS === "android") return update.android;
+  return update.android;
+}
 
 function OpenActionIcon({ size = 18, color = "#111111" }: { size?: number; color?: string }) {
   return (
@@ -317,6 +340,7 @@ export default function Auth() {
   const [connectingHostname, setConnectingHostname] = useState<string | null>(null);
   const [showPastSessionsSheet, setShowPastSessionsSheet] = useState(false);
   const [hasLoadedPairedSessions, setHasLoadedPairedSessions] = useState(false);
+  const [availableUpdate, setAvailableUpdate] = useState<UpdateCheckResponse | null>(null);
   const cancelledContinueRef = useRef(false);
   const pastSessionsButtonOpacity = useSharedValue(0);
 
@@ -363,6 +387,33 @@ export default function Auth() {
     } catch {
       Alert.alert("Unable to open link", "Please try again later.");
     }
+  }, []);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 3500);
+
+    void (async () => {
+      try {
+        const response = await fetch(UPDATE_CHECK_URL, {
+          method: "GET",
+          signal: controller.signal,
+        });
+        if (!response.ok || response.status !== 200) return;
+        const payload: unknown = await response.json();
+        if (!isUpdateCheckResponse(payload)) return;
+        setAvailableUpdate(payload);
+      } catch {
+        // Ignore update check failures and timeouts.
+      } finally {
+        clearTimeout(timeout);
+      }
+    })();
+
+    return () => {
+      clearTimeout(timeout);
+      controller.abort();
+    };
   }, []);
 
   useEffect(() => {
@@ -497,6 +548,35 @@ export default function Auth() {
 
   return (
     <View style={[styles.container, { backgroundColor: colors.bg.base }]}>
+      {availableUpdate ? (
+        <View
+          style={[
+            styles.updateBannerOverlay,
+            {
+              backgroundColor: colors.bg.base,
+            },
+          ]}
+        >
+          <Text style={[styles.updateBannerTitle, { color: colors.fg.default, fontFamily: fonts.sans.semibold }]}>
+            Oops, your app is too outdated and needs to be updated
+          </Text>
+          <TouchableOpacity
+            onPress={() => openExternalUrl(getPreferredUpdateUrl(availableUpdate))}
+            activeOpacity={0.75}
+            style={[
+              styles.updateBannerButton,
+              {
+                backgroundColor: colors.fg.default,
+                borderRadius: ctaRadius,
+              },
+            ]}
+          >
+            <Text style={[styles.updateBannerButtonText, { color: colors.bg.base, fontFamily: fonts.sans.semibold }]}>
+              Click here to update
+            </Text>
+          </TouchableOpacity>
+        </View>
+      ) : null}
       <View style={[styles.page, isTablet && styles.pageTablet]}>
         <View style={styles.hero}>
           <View style={styles.centerContent}>
@@ -612,11 +692,39 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
   },
+  updateBannerOverlay: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    zIndex: 20,
+    paddingHorizontal: 24,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 16,
+  },
   page: {
     flex: 1,
     paddingHorizontal: 20,
     paddingBottom: 28,
     justifyContent: "space-between",
+  },
+  updateBannerTitle: {
+    fontSize: 20,
+    lineHeight: 28,
+    textAlign: "center",
+    maxWidth: 420,
+  },
+  updateBannerButton: {
+    minWidth: 220,
+    paddingHorizontal: 20,
+    paddingVertical: 14,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  updateBannerButtonText: {
+    fontSize: 15,
   },
   pageTablet: {
     paddingHorizontal: 48,

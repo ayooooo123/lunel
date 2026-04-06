@@ -2,6 +2,7 @@ import Loading from "@/components/Loading";
 import PluginHeader, { usePluginHeaderHeight } from "@/components/PluginHeader";
 import { Message, useConnection } from "@/contexts/ConnectionContext";
 import { useEditorConfig } from "@/contexts/EditorContext";
+import { useReviewPrompt } from "@/contexts/ReviewPromptContext";
 import { useSessionRegistryActions } from "@/contexts/SessionRegistry";
 import { useTheme } from "@/contexts/ThemeContext";
 import { monoFamilies } from "@/constants/themes";
@@ -9,7 +10,7 @@ import { useApi } from "@/hooks/useApi";
 import { logger } from "@/lib/logger";
 import { usePlugins } from "@/plugins/context";
 import * as Haptics from "expo-haptics";
-import { ChevronDown, ChevronUp, File, FileText, Folder, FolderOpen, Keyboard as KeyboardIcon, Search, X } from "lucide-react-native";
+import { ChevronDown, ChevronUp, File, Folder, Keyboard as KeyboardIcon, Search, Star, X } from "lucide-react-native";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Alert,
@@ -303,6 +304,7 @@ export default function EditorPanel({ bottomBarHeight: _bottomBarHeight }: Plugi
   const headerHeight = usePluginHeaderHeight();
   const { openTab } = usePlugins();
   const { config } = useEditorConfig();
+  const { showEditorReviewButton, requestEditorReview } = useReviewPrompt();
   const { fs } = useApi();
   const { register, unregister } = useSessionRegistryActions();
   const extendedColors = colors as typeof colors & {
@@ -954,18 +956,38 @@ export default function EditorPanel({ bottomBarHeight: _bottomBarHeight }: Plugi
     Keyboard.dismiss();
   }, []);
 
-  return (
-    <KeyboardAvoidingView
-      style={[styles.container, { backgroundColor: colors.bg.base }]}
-      behavior={Platform.OS === "ios" ? "padding" : undefined}
-    >
-      <PluginHeader
-        title={activeTab?.title || "Editor"}
-        colors={colors}
-        showBottomBorder={!!activeTab && !isSearchOpen}
-        rightAccessoryWidth={100}
-        rightAccessory={activeTab ? (
-          <View style={{ flexDirection: "row", alignItems: "center" }}>
+  const handleReviewPress = useCallback(() => {
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Light);
+    void requestEditorReview();
+  }, [requestEditorReview]);
+
+  const headerAccessory = useMemo(() => {
+    if (!activeTab && !showEditorReviewButton) {
+      return null;
+    }
+
+    return (
+      <View style={styles.headerActions}>
+        {showEditorReviewButton ? (
+          <TouchableOpacity
+            onPress={handleReviewPress}
+            style={[
+              styles.reviewButton,
+              {
+                backgroundColor: colors.accent.default,
+                borderColor: colors.accent.default,
+              },
+            ]}
+            activeOpacity={0.85}
+          >
+            <Star size={14} color="#ffffff" strokeWidth={2.2} />
+            <Text style={[styles.reviewButtonLabel, { fontFamily: fonts.sans.medium }]}>
+              Review
+            </Text>
+          </TouchableOpacity>
+        ) : null}
+        {activeTab ? (
+          <>
             <TouchableOpacity
               onPress={isSearchOpen ? closeSearchPanel : openSearchPanel}
               style={styles.headerAction}
@@ -983,8 +1005,34 @@ export default function EditorPanel({ bottomBarHeight: _bottomBarHeight }: Plugi
             >
               <Folder size={22} color={colors.fg.muted} strokeWidth={2} />
             </TouchableOpacity>
-          </View>
+          </>
         ) : null}
+      </View>
+    );
+  }, [
+    activeTab,
+    closeSearchPanel,
+    colors.accent.default,
+    colors.fg.muted,
+    fonts.sans.medium,
+    handleReviewPress,
+    isSearchOpen,
+    openSearchPanel,
+    openTab,
+    showEditorReviewButton,
+  ]);
+
+  return (
+    <KeyboardAvoidingView
+      style={[styles.container, { backgroundColor: colors.bg.base }]}
+      behavior={Platform.OS === "ios" ? "padding" : undefined}
+    >
+      <PluginHeader
+        title={activeTab?.title || "Editor"}
+        colors={colors}
+        showBottomBorder={!!activeTab && !isSearchOpen}
+        rightAccessoryWidth={showEditorReviewButton ? 172 : 100}
+        rightAccessory={headerAccessory}
       />
 
       <View style={[styles.content, { paddingTop: headerHeight }]}>
@@ -1167,6 +1215,25 @@ const styles = StyleSheet.create({
   headerAction: {
     paddingHorizontal: 10,
     paddingVertical: 8,
+  },
+  headerActions: {
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  reviewButton: {
+    minHeight: 34,
+    paddingLeft: 10,
+    paddingRight: 12,
+    borderRadius: 999,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    borderWidth: 1,
+    marginRight: 2,
+  },
+  reviewButtonLabel: {
+    color: "#ffffff",
+    fontSize: 13,
   },
   content: {
     flex: 1,
