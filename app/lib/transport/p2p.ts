@@ -1,19 +1,20 @@
 /**
  * P2P transport for Lunel — app side.
  *
- * The CLI runs a HolesailServer (holesail library). The app cannot run
- * holesail-client directly (HyperDHT uses native UDP unavailable in RN),
- * so we connect via a HyperDHT WebSocket relay. The relay speaks the same
- * HyperDHT wire protocol on our behalf and hands us back a duplex stream
- * identical to what holesail exposes on the server side.
+ * Both devices have native UDP available but the RN JS runtime can't bind
+ * raw UDP sockets directly. We bridge through a HyperDHT relay WebSocket
+ * (run by the Holepunch community) using @hyperswarm/dht-relay, which gives
+ * us a full DHT-compatible Node object. We then call node.connect(pubkey)
+ * to get the raw noise-encrypted duplex stream that HolesailServer is
+ * listening on — no TCP proxy layer, no custom wire protocol.
  *
- * Public relay nodes operated by Holepunch / the community:
+ * Flow:
+ *   WS (relay) → dht-relay Node → node.connect(pubkey) → duplex stream
+ *   → FrameReader/FrameWriter → P2PConnection (used by v2.ts)
+ *
+ * Public relay nodes operated by Holepunch:
  *   wss://relay1.hyperdht.org
  *   wss://relay2.hyperdht.org
- *
- * Wire protocol over the relay WebSocket (after the relay delivers the stream):
- * Same length-prefixed framing as cli/src/transport/v2.ts:
- *   [4 bytes BE uint32: payload length][1 byte: 0=json 1=binary][payload]
  */
 
 import { logger } from '@/lib/logger';
@@ -23,7 +24,7 @@ const FRAME_JSON   = 0;
 const FRAME_BINARY = 1;
 const HEADER_SIZE  = 5;
 
-// ── Public Holesail/HyperDHT relay endpoints ─────────────────────────────────
+// ── Public DHT relay endpoints ────────────────────────────────────────────────
 const RELAY_URLS = [
   'wss://relay1.hyperdht.org',
   'wss://relay2.hyperdht.org',
@@ -45,7 +46,7 @@ export interface P2PConnection {
   close(): void;
 }
 
-// ── Frame reader ─────────────────────────────────────────────────────────────
+// ── Frame helpers ─────────────────────────────────────────────────────────────
 
 class FrameReader {
   private buf = new Uint8Array(0);
@@ -66,7 +67,7 @@ class FrameReader {
       if (this.buf.length < HEADER_SIZE + len) break;
       const type    = this.buf[4];
       const payload = this.buf.slice(HEADER_SIZE, HEADER_SIZE + len);
-      this.buf = this.buf.slice(HEADER_SIZE + len);
+      this.buf       = this.buf.slice(HEADER_SIZE + len);
       this.onFrame(type, payload);
     }
   }
@@ -81,58 +82,140 @@ function encodeFrame(type: 0 | 1, payload: Uint8Array | string): Uint8Array {
   return buf;
 }
 
-// ── Relay connect ─────────────────────────────────────────────────────────────
-// The relay WebSocket protocol:
-//   1. App  → relay: JSON { type: 'connect', key: '<z32 key>' }
-//   2. relay → app:  JSON { type: 'connected' }  (relay found the peer)
-//   3. All subsequent binary messages are raw stream data (our framed protocol)
+// ── DHT relay connect ─────────────────────────────────────────────────────────
 //
-// This matches the protocol used by hyperswarm-dht-relay ws.js transport and
-// is compatible with both Holepunch's public relay nodes and self-hosted ones.
+// @hyperswarm/dht-relay exposes:
+//   new Node(stream)         — takes any duplex, returns a hyperdht-compatible node
+//   node.connect(pubKey)     — returns a noise-encrypted duplex stream to the server
+//
+// We feed it the WS-backed duplex from @hyperswarm/dht-relay/ws (same pkg).
 
-async function connectViaRelay(
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const DhtRelayNode    = require('@hyperswarm/dht-relay') as any;
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const DhtRelayWsStream = require('@hyperswarm/dht-relay/ws') as any;
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+const z32             = require('z32') as any;
+
+async function connectViaDhtRelay(
   z32Key: string,
   relayUrl: string,
-): Promise<WebSocket> {
+): Promise<P2PConnection & { _destroy: () => void }> {
   return new Promise((resolve, reject) => {
     let settled = false;
-    const ws = new WebSocket(relayUrl);
-    ws.binaryType = 'arraybuffer';
 
+    const ws = new WebSocket(relayUrl);
     const timeout = setTimeout(() => {
       if (!settled) {
         settled = true;
         ws.close();
-        reject(new Error(`Relay timeout: ${relayUrl}`));
+        reject(new Error(`DHT relay timeout: ${relayUrl}`));
       }
-    }, 15_000);
+    }, 20_000);
 
     ws.onopen = () => {
-      ws.send(JSON.stringify({ type: 'connect', key: z32Key }));
-    };
+      clearTimeout(timeout);
+      if (settled) return;
 
-    ws.onmessage = (event) => {
-      if (typeof event.data !== 'string') return;
       try {
-        const msg = JSON.parse(event.data) as { type?: string; reason?: string };
-        if (msg.type === 'connected') {
-          clearTimeout(timeout);
-          if (!settled) { settled = true; resolve(ws); }
-        } else if (msg.type === 'error') {
-          clearTimeout(timeout);
-          if (!settled) { settled = true; ws.close(); reject(new Error(msg.reason ?? 'relay error')); }
+        // Wrap the WebSocket in a streamx Duplex for the relay protocol
+        const wsStream = new DhtRelayWsStream(true /* isInitiator */, ws);
+
+        // Create a relay-backed DHT node — same API as real HyperDHT
+        const node = new DhtRelayNode(wsStream);
+
+        // Decode the z32 key to a 32-byte public key buffer
+        const pubKey: Uint8Array = z32.decode(z32Key);
+
+        // Connect — returns a noise-encrypted duplex stream (streamx Duplex)
+        // This is the same stream that HolesailServer exposes to handleTCP
+        const duplexStream = node.connect(pubKey);
+
+        // Wait for the noise handshake to complete (stream.opened promise)
+        Promise.resolve(duplexStream.opened ?? Promise.resolve()).then(() => {
+          if (settled) { duplexStream.destroy(); return; }
+          settled = true;
+
+          logger.info('p2p', 'DHT relay stream opened', { relay: relayUrl });
+
+          const conn: P2PConnection & {
+            _destroy: () => void;
+            onMessage?: P2PMessageHandler;
+            onClose?: P2PCloseHandler;
+          } = {
+            send(type: 'json' | 'binary', data: string | Uint8Array) {
+              const frame = type === 'json'
+                ? encodeFrame(FRAME_JSON,   data as string)
+                : encodeFrame(FRAME_BINARY, data as Uint8Array);
+              duplexStream.write(Buffer.from(frame.buffer, frame.byteOffset, frame.byteLength));
+            },
+            close() {
+              duplexStream.destroy();
+              node.destroy().catch(() => {});
+            },
+            _destroy() {
+              duplexStream.destroy();
+              node.destroy().catch(() => {});
+              ws.close();
+            },
+          };
+
+          // Wire stream events now that conn is declared
+          const reader = new FrameReader((type, payload) => {
+            void (async () => {
+              try {
+                if (type === FRAME_JSON) {
+                  await conn.onMessage?.('json', new TextDecoder().decode(payload));
+                } else {
+                  await conn.onMessage?.('binary', payload);
+                }
+              } catch (err) {
+                logger.warn('p2p', 'frame handler error', {
+                  error: err instanceof Error ? err.message : String(err),
+                });
+              }
+            })();
+          });
+
+          duplexStream.on('data', (chunk: Buffer | Uint8Array) => {
+            reader.push(chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk.buffer, chunk.byteOffset, chunk.byteLength));
+          });
+
+          duplexStream.on('close', () => conn.onClose?.('DHT stream closed'));
+          duplexStream.on('error', (err: Error) => conn.onClose?.(`DHT stream error: ${err.message}`));
+
+          resolve(conn);
+        }).catch((err: Error) => {
+          if (!settled) {
+            settled = true;
+            duplexStream.destroy();
+            node.destroy().catch(() => {});
+            reject(err);
+          }
+        });
+      } catch (err) {
+        if (!settled) {
+          settled = true;
+          ws.close();
+          reject(err);
         }
-      } catch { /* ignore non-JSON */ }
+      }
     };
 
     ws.onerror = () => {
       clearTimeout(timeout);
-      if (!settled) { settled = true; reject(new Error(`Relay WS error: ${relayUrl}`)); }
+      if (!settled) {
+        settled = true;
+        reject(new Error(`DHT relay WS error: ${relayUrl}`));
+      }
     };
 
-    ws.onclose = (e) => {
+    ws.onclose = (e: CloseEvent) => {
       clearTimeout(timeout);
-      if (!settled) { settled = true; reject(new Error(`Relay closed: ${e.code}`)); }
+      if (!settled) {
+        settled = true;
+        reject(new Error(`DHT relay WS closed early: ${(e as any).code}`));
+      }
     };
   });
 }
@@ -142,10 +225,10 @@ async function connectViaRelay(
 /**
  * Connect to a CLI peer running HolesailServer.
  *
- * @param z32Key     - 52-char z32 key shown as QR on CLI
- * @param onMessage  - called for each decoded frame
- * @param onClose    - called when stream closes
- * @returns P2PConnection for sending framed data
+ * @param z32Key    - 52-char z32 key shown as QR on the CLI
+ * @param onMessage - called for each decoded frame from the CLI
+ * @param onClose   - called when the stream closes
+ * @returns P2PConnection for sending framed data back to the CLI
  */
 export async function connectP2P(
   z32Key: string,
@@ -156,52 +239,24 @@ export async function connectP2P(
 
   for (const relayUrl of RELAY_URLS) {
     try {
-      logger.info('p2p', 'trying Holesail relay', { relayUrl, key: z32Key.slice(0, 8) + '…' });
+      logger.info('p2p', 'trying DHT relay', { relay: relayUrl, key: z32Key.slice(0, 8) + '…' });
 
-      const ws = await connectViaRelay(z32Key, relayUrl);
-      logger.info('p2p', 'Holesail relay connected', { relayUrl });
+      const conn = await connectViaDhtRelay(z32Key, relayUrl);
 
-      const reader = new FrameReader((type, payload) => {
-        void (async () => {
-          try {
-            if (type === FRAME_JSON) {
-              await onMessage('json', new TextDecoder().decode(payload));
-            } else {
-              await onMessage('binary', payload);
-            }
-          } catch (err) {
-            logger.warn('p2p', 'frame handler error', {
-              error: err instanceof Error ? err.message : String(err),
-            });
-          }
-        })();
-      });
+      // Wire up the handlers now that we have a connection object
+      (conn as any).onMessage = onMessage;
+      (conn as any).onClose   = onClose;
 
-      // After handshake, all binary messages are our framed protocol
-      ws.onmessage = (event) => {
-        if (event.data instanceof ArrayBuffer) {
-          reader.push(new Uint8Array(event.data));
-        }
-        // string messages handled during connect phase only
-      };
-
-      ws.onclose = (e) => onClose(`Holesail relay closed (${e.code}: ${e.reason})`);
-      ws.onerror = ()  => onClose('Holesail relay WebSocket error');
-
-      return {
-        send(type: 'json' | 'binary', data: string | Uint8Array) {
-          const frame = type === 'json'
-            ? encodeFrame(FRAME_JSON,   data as string)
-            : encodeFrame(FRAME_BINARY, data as Uint8Array);
-          ws.send(frame.buffer.slice(frame.byteOffset, frame.byteOffset + frame.byteLength));
-        },
-        close() { ws.close(); },
-      };
+      logger.info('p2p', 'DHT relay connected — raw stream to CLI', { relay: relayUrl });
+      return conn;
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err));
-      logger.warn('p2p', 'relay failed, trying next', { relayUrl, error: lastError.message });
+      logger.warn('p2p', 'relay failed, trying next', {
+        relay: relayUrl,
+        error: lastError.message,
+      });
     }
   }
 
-  throw lastError ?? new Error('All Holesail relay nodes failed');
+  throw lastError ?? new Error('All DHT relay nodes failed');
 }
