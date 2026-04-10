@@ -45,3 +45,6 @@ app-example
 /android
 # hot-updater
 .hot-updater/output
+
+# Bare worklet build artifacts (regenerated from backend/p2p.js)
+backend/*.bundle
