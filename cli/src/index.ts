@@ -11,9 +11,13 @@ import Ignore from "ignore";
 import { createRequire as _createRequire } from "module";
 const _require = _createRequire(import.meta.url);
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const DHT = _require("hyperdht") as any;
+const HolesailServer = _require("holesail-server") as any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const HolesailClient = _require("holesail-client") as any;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 const b4a = _require("b4a") as any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const z32 = _require("z32") as any;
 const ignore = Ignore.default;
 type IgnoreInstance = ReturnType<typeof ignore>;
 import * as fs from "fs/promises";
@@ -31,9 +35,8 @@ const LEGACY_GATEWAY = process.env.LUNEL_PROXY_URL ? normalizeGatewayUrl(process
 const DEFAULT_PROXY_URL = LEGACY_GATEWAY ?? "https://gateway.lunel.dev";
 const MANAGER_URL = process.env.LUNEL_MANAGER_URL ? normalizeGatewayUrl(process.env.LUNEL_MANAGER_URL) : "https://manager.lunel.dev";
 
-// HyperDHT state for P2P mode
-let dhtNode: any = null;
-let dhtServer: any = null;
+// Holesail state for P2P mode
+let dhtServer: any = null;  // HolesailServer instance
 let localProxyWsServer: WebSocketServer | null = null;
 let localProxyWsPort = 0;
 const CLI_ARGS = process.argv.slice(2);
@@ -3375,12 +3378,9 @@ function gracefulShutdown(): void {
     localProxyWsServer = null;
   }
   if (dhtServer) {
-    void dhtServer.close().catch(() => {});
+    // HolesailServer.destroy() cleans up the DHT node and server
+    void dhtServer.destroy().catch(() => {});
     dhtServer = null;
-  }
-  if (dhtNode) {
-    void dhtNode.destroy().catch(() => {});
-    dhtNode = null;
   }
   process.exit(0);
 }
@@ -3527,27 +3527,30 @@ function makeV2Handlers(onClose: (reason: string) => void): import("./transport/
   };
 }
 
-// ── P2P: start HyperDHT server ───────────────────────────────────────────────
-async function startDhtServer(seedHex: string | null): Promise<{ keyHex: string; seedHex: string }> {
-  dhtNode = new DHT();
-  await dhtNode.ready();
+// ── P2P: start Holesail server ────────────────────────────────────────────────
+// We use HolesailServer for DHT key management and announce, but intercept
+// incoming connections before they're piped to a local TCP port — instead
+// we run V2SessionTransport directly over the raw duplex stream.
+async function startDhtServer(savedSeed: string | null): Promise<{ key: string; seed: string }> {
+  const holesailServer = new HolesailServer();
 
-  let seed: Buffer;
-  if (seedHex) {
-    seed = Buffer.from(seedHex, "hex");
-  } else {
-    seed = DHT.keyPair().secretKey.slice(0, 32); // random seed
-  }
+  // generateKeyPair accepts a hex seed string; pass null for random
+  holesailServer.generateKeyPair(savedSeed ?? undefined);
 
-  const keyPair = DHT.keyPair(seed);
+  const key: string = holesailServer.key;   // z32-encoded public key (52 chars)
+  const seed: string = b4a.toString(holesailServer.seed, "hex");
+  // sessionSecret must match the app side which uses the z32 key string
+  const sessionSecret = key;
 
-  dhtServer = dhtNode.createServer(async (conn: any) => {
-    if (shuttingDown) { conn.destroy(); return; }
-    console.log("App connecting via P2P...");
+  // Override handleTCP to intercept the raw HyperDHT stream instead of
+  // piping it to a local TCP port. The stream `c` is a full duplex.
+  holesailServer.handleTCP = async (c: any) => {
+    if (shuttingDown) { c.destroy(); return; }
+    console.log("App connecting via P2P (Holesail)...");
 
     const transport = new V2SessionTransport({
       role: "cli",
-      sessionSecret: b4a.toString(keyPair.publicKey, "hex"),
+      sessionSecret,
       debugLog: DEBUG_MODE ? debugLog : undefined,
       handlers: makeV2Handlers((reason) => {
         if (shuttingDown) return;
@@ -3555,7 +3558,6 @@ async function startDhtServer(seedHex: string | null): Promise<{ keyHex: string;
         cleanupAllTunnels();
         activeV2Transport = null;
         console.log(`\nP2P connection closed: ${reason}`);
-        // In P2P mode the app just reconnects by scanning the same key
       }),
     });
 
@@ -3563,21 +3565,23 @@ async function startDhtServer(seedHex: string | null): Promise<{ keyHex: string;
     startPortSync();
 
     try {
-      await transport.connectStream(conn);
+      await transport.connectStream(c);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (!shuttingDown) console.error(`[p2p] transport error: ${msg}`);
       activeV2Transport = null;
       stopPortSync();
     }
+  };
+
+  // Start — holesail-server calls handleTCP for each incoming connection
+  await new Promise<void>((resolve) => {
+    void holesailServer.start({ seed, secure: false }, resolve);
   });
 
-  await dhtServer.listen(keyPair);
+  dhtServer = holesailServer;
 
-  return {
-    keyHex: b4a.toString(keyPair.publicKey, "hex"),
-    seedHex: b4a.toString(seed, "hex"),
-  };
+  return { key, seed };
 }
 
 async function connectWebSocketV2(): Promise<void> {
@@ -3687,17 +3691,17 @@ async function main(): Promise<void> {
       }
     }
 
-    // Start HyperDHT server
-    console.log("Starting P2P server...");
-    const { keyHex, seedHex } = await startDhtServer(savedSeedHex);
-    currentSessionCode = keyHex;
+    // Start Holesail server
+    console.log("Starting P2P server (Holesail)...");
+    const { key, seed } = await startDhtServer(savedSeedHex);
+    currentSessionCode = key;
 
-    // Save the seed so the key persists across restarts
-    await saveSessionForRoot(keyHex, seedHex);
+    // Save the seed (hex) so the key persists across restarts
+    await saveSessionForRoot(key, seed);
 
-    // Display the DHT public key as QR code for the app to scan
-    displayQR(keyHex);
-    console.log("  Waiting for app to connect via P2P (HyperDHT)...\n");
+    // Display the Holesail z32 key as QR code for the app to scan
+    displayQR(key);
+    console.log("  Waiting for app to connect via P2P (Holesail)...\n");
     console.log("  No server required — connection is fully peer-to-peer.\n");
 
     // Keep running — the DHT server handles incoming connections

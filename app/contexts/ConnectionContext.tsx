@@ -7,9 +7,9 @@ import { logger } from '@/lib/logger';
 import { V2SessionTransport } from '@/lib/transport/v2';
 import { connectP2P } from '@/lib/transport/p2p';
 
-// A HyperDHT pubkey is 64 hex chars
+// A Holesail key is a 52-char z32 string (base32 variant)
 function isP2PKey(code: string): boolean {
-  return /^[0-9a-f]{64}$/i.test(code.trim());
+  return /^[a-z0-9]{52}$/i.test(code.trim());
 }
 
 const DEFAULT_GATEWAY = 'wss://gateway.lunel.dev';
@@ -1296,18 +1296,18 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
     await clearStoredSession();
   }, [clearStoredSession, sendPlaintextSystemRequestV2]);
 
-  // ── P2P connect (HyperDHT relay mode) ───────────────────────────────────────
-  const connectToP2P = useCallback(async (keyHex: string): Promise<void> => {
+  // ── P2P connect (Holesail) ───────────────────────────────────────────────────
+  const connectToP2P = useCallback(async (z32Key: string): Promise<void> => {
     const generation = ++connectionGenerationRef.current;
-    logger.info('connection', 'connecting via HyperDHT P2P relay', {
-      keyHex: keyHex.slice(0, 16) + '…',
+    logger.info('connection', 'connecting via Holesail P2P', {
+      key: z32Key.slice(0, 8) + '…',
       generation,
     });
 
     const transport = new V2SessionTransport({
-      gatewayUrl: 'p2p://' + keyHex,
-      password: keyHex,
-      sessionSecret: keyHex,
+      gatewayUrl: 'p2p://' + z32Key,
+      password: z32Key,
+      sessionSecret: z32Key,
       role: 'app',
       debugLog: (message, ...args) => logger.info('connection', message, { args }),
       handlers: {
@@ -1321,7 +1321,7 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
             setError(null);
             if (sessionCodeRef.current && sendControlRef.current) {
               configureProxy(
-                'p2p://' + keyHex,
+                'p2p://' + z32Key,
                 sessionCodeRef.current,
                 sessionPasswordRef.current,
                 gatewaysRef.current,
@@ -1395,7 +1395,7 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
     v2TransportRef.current = transport;
 
     const p2pConn = await connectP2P(
-      keyHex,
+      z32Key,
       async (type, data) => {
         try {
           await transport.handleP2PMessage(type, data);
@@ -1414,14 +1414,14 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
       },
     );
 
-    await transport.connectStream(p2pConn, keyHex);
+    await transport.connectStream(p2pConn, z32Key);
 
     if (generation !== connectionGenerationRef.current || v2TransportRef.current !== transport) {
       transport.close();
       return;
     }
 
-    logger.info('connection', 'requesting capabilities over P2P');
+    logger.info('connection', 'requesting capabilities over Holesail P2P');
     const response = await sendMessageV2('system', 'capabilities');
     if (generation !== connectionGenerationRef.current || v2TransportRef.current !== transport) {
       transport.close();
@@ -1439,19 +1439,19 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
     setIsReconnecting(false);
     networkReachableRef.current = true;
 
-    // Persist session (use keyHex as both code and password for P2P)
+    // Persist session (z32Key is both the code and the session identifier)
     try {
       await savePairedSession({
-        sessionCode: keyHex,
-        sessionPassword: keyHex,
-        gateways: ['p2p://' + keyHex],
+        sessionCode: z32Key,
+        sessionPassword: z32Key,
+        gateways: ['p2p://' + z32Key],
         savedAt: Date.now(),
       }, {
         hostname: String((response.payload as Record<string, unknown>).hostname ?? ''),
         rootDir: String((response.payload as Record<string, unknown>).rootDir ?? ''),
       });
     } catch (error) {
-      logger.warn('connection', 'failed to persist P2P paired session', {
+      logger.warn('connection', 'failed to persist Holesail P2P session', {
         error: error instanceof Error ? error.message : String(error),
       });
     }
@@ -1476,7 +1476,7 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
       throw new Error('Invalid connection code');
     }
 
-    // ── P2P mode: code is a 64-char HyperDHT hex key ──────────────────────
+    // ── P2P mode: code is a 52-char Holesail z32 key ──────────────────────
     if (isP2PKey(parsed.code)) {
       setSessionState('pending');
       setStatus('connecting');
