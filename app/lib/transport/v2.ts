@@ -1,4 +1,5 @@
 import sodium from 'react-native-libsodium';
+import type { P2PConnection } from './p2p';
 import type {
   EncryptedProtocolEnvelope,
   EventMessage,
@@ -77,6 +78,7 @@ function decodeUtf8(value: Uint8Array): string {
 export class V2SessionTransport {
   private readonly options: V2TransportOptions;
   private ws: WebSocket | null = null;
+  private p2p: P2PConnection | null = null;
   private closed = false;
   private state: TransportState = 'idle';
   private keyPair: KeyPair | null = null;
@@ -197,9 +199,58 @@ export class V2SessionTransport {
     this.ws.send(JSON.stringify(message));
   }
 
+  // ── P2P connect (HyperDHT relay mode) ─────────────────────────────────────
+  async connectStream(p2pConn: P2PConnection, serverKeyHex: string): Promise<void> {
+    await sodium.ready;
+
+    this.p2p = p2pConn;
+    this.closed = false;
+    this.state = 'open';
+
+    this.secureReadyPromise = new Promise<void>((resolve, reject) => {
+      this.secureReadyResolve = resolve;
+      this.secureReadyReject = reject;
+    });
+
+    // App initiates handshake in P2P mode (same as WS mode with role='app')
+    this.resetPeerSession();
+    await this.maybeStartHandshake();
+
+    if (!this.secureReadyPromise) throw new Error('secure readiness promise missing');
+    await this.secureReadyPromise;
+  }
+
+  // Called by the P2P layer when a frame arrives
+  async handleP2PMessage(type: 'json' | 'binary', data: string | Uint8Array): Promise<void> {
+    if (type === 'json') {
+      const raw = JSON.parse(data as string) as SystemMessage | Message | Response | V2HandshakeFrame;
+      if ('type' in raw) {
+        await this.options.handlers.onSystemMessage(raw);
+        if (raw.type === 'peer_connected') {
+          this.resetPeerSession();
+          await this.maybeStartHandshake();
+        } else if (raw.type === 'peer_disconnected' || raw.type === 'cli_reconnecting') {
+          this.resetPeerSession();
+        }
+        return;
+      }
+      if (isV2HandshakeFrame(raw)) {
+        await this.handleHandshakeFrame(raw);
+        return;
+      }
+      throw new Error('unexpected json frame in P2P mode');
+    } else {
+      await this.handleMessage(data as Uint8Array);
+    }
+  }
+
   close(): void {
     this.closed = true;
     this.state = 'closed';
+    if (this.p2p) {
+      try { this.p2p.close(); } catch { /* ignore */ }
+      this.p2p = null;
+    }
     if (!this.ws) return;
     if (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING) {
       this.ws.close();
@@ -479,6 +530,10 @@ export class V2SessionTransport {
   }
 
   private sendJsonFrame(frame: V2HandshakeFrame): void {
+    if (this.p2p) {
+      this.p2p.send('json', JSON.stringify(frame));
+      return;
+    }
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new Error('v2 transport is not connected');
     }
@@ -486,10 +541,14 @@ export class V2SessionTransport {
   }
 
   private sendBinaryFrame(ciphertext: Uint8Array): void {
+    const framed = encodeV2EncryptedFrame(ciphertext);
+    if (this.p2p) {
+      this.p2p.send('binary', framed);
+      return;
+    }
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new Error('v2 transport is not connected');
     }
-    const framed = encodeV2EncryptedFrame(ciphertext);
     this.ws.send(framed.buffer.slice(framed.byteOffset, framed.byteOffset + framed.byteLength));
   }
 

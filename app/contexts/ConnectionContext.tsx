@@ -5,6 +5,12 @@ import { AppState } from 'react-native';
 import { configureProxy, startPortServers, stopAllServers } from '@/lib/proxyServer';
 import { logger } from '@/lib/logger';
 import { V2SessionTransport } from '@/lib/transport/v2';
+import { connectP2P } from '@/lib/transport/p2p';
+
+// A HyperDHT pubkey is 64 hex chars
+function isP2PKey(code: string): boolean {
+  return /^[0-9a-f]{64}$/i.test(code.trim());
+}
 
 const DEFAULT_GATEWAY = 'wss://gateway.lunel.dev';
 const MANAGER_URL = 'https://manager.lunel.dev';
@@ -1290,6 +1296,167 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
     await clearStoredSession();
   }, [clearStoredSession, sendPlaintextSystemRequestV2]);
 
+  // ── P2P connect (HyperDHT relay mode) ───────────────────────────────────────
+  const connectToP2P = useCallback(async (keyHex: string): Promise<void> => {
+    const generation = ++connectionGenerationRef.current;
+    logger.info('connection', 'connecting via HyperDHT P2P relay', {
+      keyHex: keyHex.slice(0, 16) + '…',
+      generation,
+    });
+
+    const transport = new V2SessionTransport({
+      gatewayUrl: 'p2p://' + keyHex,
+      password: keyHex,
+      sessionSecret: keyHex,
+      role: 'app',
+      debugLog: (message, ...args) => logger.info('connection', message, { args }),
+      handlers: {
+        onSystemMessage: async (message) => {
+          if (generation !== connectionGenerationRef.current || v2TransportRef.current !== transport) return;
+          if (message.type === 'connected') return;
+
+          if (message.type === 'peer_connected') {
+            logger.info('connection', 'P2P peer connected');
+            setSessionState((current) => current === 'cli_offline_grace' ? 'pending' : current);
+            setError(null);
+            if (sessionCodeRef.current && sendControlRef.current) {
+              configureProxy(
+                'p2p://' + keyHex,
+                sessionCodeRef.current,
+                sessionPasswordRef.current,
+                gatewaysRef.current,
+                sendControlRef.current,
+              );
+            }
+            return;
+          }
+
+          if (message.type === 'peer_disconnected') {
+            logger.warn('connection', 'P2P peer disconnected');
+            stopAllServers();
+            setSessionState('cli_offline_grace');
+            setStatus('connected');
+            setError('CLI disconnected. Waiting for reconnect…');
+            return;
+          }
+
+          if (message.type === 'close_connection') {
+            logger.warn('connection', 'P2P connection closed', { reason: message.reason });
+            stopAllServers();
+            setSessionState((message.reason || '').toLowerCase().includes('expired') ? 'expired' : 'ended');
+            setStatus('error');
+            setError(message.reason || 'Session ended');
+          }
+        },
+        onProtocolRequest: async () => ({
+          v: 1 as const,
+          id: generateId(),
+          ns: 'system',
+          action: 'unsupported',
+          ok: false,
+          payload: {},
+          error: { code: 'EUNSUPPORTED', message: 'App does not serve protocol requests' },
+        }),
+        onProtocolResponse: async (response) => {
+          if (generation !== connectionGenerationRef.current || v2TransportRef.current !== transport) return;
+          const pending = pendingRequestsRef.current.get(response.id);
+          if (pending) {
+            clearTimeout(pending.timeout);
+            pendingRequestsRef.current.delete(response.id);
+            pending.resolve(response);
+          }
+        },
+        onProtocolEvent: async (message) => {
+          if (generation !== connectionGenerationRef.current || v2TransportRef.current !== transport) return;
+          if (message.ns === 'proxy' && message.action === 'ports_discovered') {
+            const ports = message.payload?.ports as number[];
+            if (Array.isArray(ports)) {
+              discoveredPortsRef.current = ports;
+              setDiscoveredProxyPorts(ports);
+              if (AppState.currentState === 'active') {
+                startPortServers(ports);
+              }
+            }
+            return;
+          }
+          for (const handler of dataEventHandlersRef.current) {
+            handler(message);
+          }
+        },
+        onClose: (reason) => {
+          if (generation !== connectionGenerationRef.current || v2TransportRef.current !== transport) return;
+          logger.warn('connection', 'P2P transport closed', { reason });
+          if (manualDisconnectRef.current || reconnectingRef.current) return;
+          void runReconnectLoopRef.current?.('transport_closed');
+        },
+      },
+    });
+
+    v2TransportRef.current = transport;
+
+    const p2pConn = await connectP2P(
+      keyHex,
+      async (type, data) => {
+        try {
+          await transport.handleP2PMessage(type, data);
+        } catch (err) {
+          logger.warn('connection', 'P2P message handling error', {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      },
+      (reason) => {
+        if (generation !== connectionGenerationRef.current || v2TransportRef.current !== transport) return;
+        logger.warn('connection', 'P2P connection closed', { reason });
+        if (!manualDisconnectRef.current && !reconnectingRef.current) {
+          void runReconnectLoopRef.current?.('transport_closed');
+        }
+      },
+    );
+
+    await transport.connectStream(p2pConn, keyHex);
+
+    if (generation !== connectionGenerationRef.current || v2TransportRef.current !== transport) {
+      transport.close();
+      return;
+    }
+
+    logger.info('connection', 'requesting capabilities over P2P');
+    const response = await sendMessageV2('system', 'capabilities');
+    if (generation !== connectionGenerationRef.current || v2TransportRef.current !== transport) {
+      transport.close();
+      return;
+    }
+    if (!response.ok) {
+      throw new Error(response.error?.message || 'Failed to get capabilities');
+    }
+
+    setCapabilities(response.payload as unknown as Capabilities);
+    setSessionState('active');
+    setStatus('connected');
+    setError(null);
+    setInteractionBlockReason(null);
+    setIsReconnecting(false);
+    networkReachableRef.current = true;
+
+    // Persist session (use keyHex as both code and password for P2P)
+    try {
+      await savePairedSession({
+        sessionCode: keyHex,
+        sessionPassword: keyHex,
+        gateways: ['p2p://' + keyHex],
+        savedAt: Date.now(),
+      }, {
+        hostname: String((response.payload as Record<string, unknown>).hostname ?? ''),
+        rootDir: String((response.payload as Record<string, unknown>).rootDir ?? ''),
+      });
+    } catch (error) {
+      logger.warn('connection', 'failed to persist P2P paired session', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }, [clearPendingRequests, generateId, savePairedSession, sendMessageV2]);
+
   const connect = useCallback(async (payload: string) => {
     logger.info('connection', 'connect requested', { payloadPreview: payload.trim().slice(0, 32) });
     manualDisconnectRef.current = false;
@@ -1309,6 +1476,31 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
       throw new Error('Invalid connection code');
     }
 
+    // ── P2P mode: code is a 64-char HyperDHT hex key ──────────────────────
+    if (isP2PKey(parsed.code)) {
+      setSessionState('pending');
+      setStatus('connecting');
+      setError(null);
+      setSessionCode(parsed.code);
+      sessionCodeRef.current = parsed.code;
+      sessionPasswordRef.current = parsed.code;
+      gatewaysRef.current = ['p2p://' + parsed.code];
+      reattachGenerationRef.current = null;
+
+      try {
+        await connectToP2P(parsed.code);
+        return;
+      } catch (err) {
+        const lastError = err instanceof Error ? err : new Error('P2P connection failed');
+        logger.error('connection', 'P2P connect failed', { error: lastError.message });
+        setSessionState('ended');
+        setStatus('error');
+        setError(lastError.message);
+        throw lastError;
+      }
+    }
+
+    // ── Legacy gateway mode: resolve via manager ───────────────────────────
     let assembled: AssembleResult;
     try {
       logger.info('connection', 'assembling session in manager', { code: parsed.code });
@@ -1363,7 +1555,7 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
       setError(lastError.message);
       throw lastError;
     }
-  }, [assembleWithCode, cleanupSockets, connectToGatewayV2, getAssignedProxyUrl]);
+  }, [assembleWithCode, cleanupSockets, connectToGatewayV2, connectToP2P, getAssignedProxyUrl]);
 
   const resumeSession = useCallback(async (stored: StoredSession) => {
     logger.info('connection', 'resume requested', {
@@ -1388,6 +1580,25 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
     setStatus('connecting');
     setError(null);
     setSessionCode(stored.sessionCode || null);
+
+    // P2P sessions: password is the DHT hex key
+    if (isP2PKey(stored.sessionPassword)) {
+      sessionCodeRef.current = stored.sessionCode || stored.sessionPassword;
+      sessionPasswordRef.current = stored.sessionPassword;
+      gatewaysRef.current = ['p2p://' + stored.sessionPassword];
+      reattachGenerationRef.current = null;
+
+      try {
+        await connectToP2P(stored.sessionPassword);
+        return;
+      } catch (err) {
+        const lastError = err instanceof Error ? err : new Error('P2P resume failed');
+        setSessionState('ended');
+        setStatus('error');
+        setError(lastError.message);
+        throw lastError;
+      }
+    }
 
     try {
       sessionCodeRef.current = stored.sessionCode || null;
@@ -1427,7 +1638,7 @@ export function ConnectionProvider({ children }: { children: React.ReactNode }) 
       setError(lastError.message);
       throw lastError;
     }
-  }, [claimReattach, cleanupSockets, connectToGatewayV2]);
+  }, [claimReattach, cleanupSockets, connectToGatewayV2, connectToP2P]);
 
   useEffect(() => {
     const sub = AppState.addEventListener('change', (nextState) => {

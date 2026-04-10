@@ -99,8 +99,13 @@ export function configureProxy(
   gateways: string[],
   sendControl: (ns: string, action: string, payload?: Record<string, unknown>) => Promise<any>,
 ): void {
-  activeGatewayWsUrl = gatewayWsUrl || DEFAULT_GATEWAY_WS_URL;
-  failoverGatewayWsUrls = gateways.length > 0 ? gateways : [activeGatewayWsUrl];
+  // In P2P mode the proxy tunnels are multiplexed over the main DHT connection.
+  // The app side connects proxy tunnels back to the CLI's local WS server via
+  // the same Holesail DHT key. We skip the centralized gateway in this mode.
+  const isP2P = gatewayWsUrl.startsWith('p2p://');
+  activeGatewayWsUrl = isP2P ? DEFAULT_GATEWAY_WS_URL : (gatewayWsUrl || DEFAULT_GATEWAY_WS_URL);
+  failoverGatewayWsUrls = gateways.filter((g) => !g.startsWith('p2p://'));
+  if (failoverGatewayWsUrls.length === 0) failoverGatewayWsUrls = [activeGatewayWsUrl];
   sessionCode = code;
   sessionPassword = password;
   sendControlMessage = sendControl;

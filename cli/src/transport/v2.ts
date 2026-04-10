@@ -1,5 +1,6 @@
 import { WebSocket } from "ws";
 import { createRequire } from "module";
+import type { Duplex } from "stream";
 import type {
   EncryptedProtocolEnvelope,
   EventMessage,
@@ -36,9 +37,9 @@ export interface V2TransportHandlers {
 }
 
 export interface V2TransportOptions {
-  gatewayUrl: string;
-  password: string;
-  sessionSecret: string;
+  gatewayUrl?: string;
+  password?: string;
+  sessionSecret?: string;
   generation?: number | null;
   role: "cli" | "app";
   handlers: V2TransportHandlers;
@@ -74,9 +75,52 @@ function decodeUtf8(value: Uint8Array): string {
   return decoder.decode(value);
 }
 
+// ─── Stream framing ────────────────────────────────────────────────────────
+// Holesail gives us a raw duplex stream (TCP-like). We use a simple
+// length-prefixed framing:
+//   [4 bytes big-endian uint32: payload length][1 byte: type 0=json 1=binary][payload]
+// This matches what the app side expects.
+
+const FRAME_TYPE_JSON = 0;
+const FRAME_TYPE_BINARY = 1;
+
+function encodeStreamFrame(type: 0 | 1, payload: Buffer | Uint8Array): Buffer {
+  const buf = Buffer.from(payload);
+  const header = Buffer.allocUnsafe(5);
+  header.writeUInt32BE(buf.length, 0);
+  header[4] = type;
+  return Buffer.concat([header, buf]);
+}
+
+class StreamFrameReader {
+  private buf = Buffer.alloc(0);
+  private onFrame: (type: number, payload: Buffer) => void;
+
+  constructor(onFrame: (type: number, payload: Buffer) => void) {
+    this.onFrame = onFrame;
+  }
+
+  push(chunk: Buffer): void {
+    this.buf = Buffer.concat([this.buf, chunk]);
+    this.drain();
+  }
+
+  private drain(): void {
+    while (this.buf.length >= 5) {
+      const len = this.buf.readUInt32BE(0);
+      if (this.buf.length < 5 + len) break;
+      const type = this.buf[4];
+      const payload = this.buf.slice(5, 5 + len);
+      this.buf = this.buf.slice(5 + len);
+      this.onFrame(type, payload);
+    }
+  }
+}
+
 export class V2SessionTransport {
   private readonly options: V2TransportOptions;
   private ws: WebSocket | null = null;
+  private stream: Duplex | null = null;
   private closed = false;
   private state: TransportState = "idle";
   private keyPair: KeyPair | null = null;
@@ -90,6 +134,7 @@ export class V2SessionTransport {
     this.options = options;
   }
 
+  // ── WebSocket-based connect (original gateway mode) ──────────────────────
   async connect(): Promise<void> {
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
       if (this.secureReadyPromise) {
@@ -105,9 +150,9 @@ export class V2SessionTransport {
     });
 
     const wsUrl = buildSessionV2WsUrl(
-      this.options.gatewayUrl,
+      this.options.gatewayUrl!,
       this.options.role,
-      this.options.password,
+      this.options.password!,
       this.options.generation,
     );
 
@@ -163,6 +208,98 @@ export class V2SessionTransport {
     await this.secureReadyPromise;
   }
 
+  // ── HyperDHT stream-based connect (P2P mode) ─────────────────────────────
+  async connectStream(duplex: Duplex): Promise<void> {
+    await sodium.ready;
+
+    this.secureReadyPromise = new Promise<void>((resolve, reject) => {
+      this.secureReadyResolve = resolve;
+      this.secureReadyReject = reject;
+    });
+
+    this.stream = duplex;
+    this.closed = false;
+    this.state = "open";
+
+    const reader = new StreamFrameReader((type, payload) => {
+      void (async () => {
+        try {
+          if (type === FRAME_TYPE_JSON) {
+            const text = payload.toString("utf-8");
+            const raw = JSON.parse(text) as SystemMessage | Message | Response | V2HandshakeFrame;
+            await this.handleParsedJson(raw);
+          } else {
+            await this.handleMessage(payload as unknown as WebSocket.RawData, true);
+          }
+        } catch (error) {
+          this.options.debugLog?.("[transport:v2:stream] message handling failed", error);
+          this.failSecure(new Error(error instanceof Error ? error.message : String(error)));
+          this.close();
+        }
+      })();
+    });
+
+    duplex.on("data", (chunk: Buffer) => reader.push(chunk));
+
+    duplex.on("close", () => {
+      this.stream = null;
+      this.state = "closed";
+      if (!this.closed) {
+        this.closed = true;
+        this.failSecure(new Error("DHT stream closed"));
+        this.options.handlers.onClose("DHT stream closed");
+      }
+    });
+
+    duplex.on("error", (err) => {
+      this.options.debugLog?.("[transport:v2:stream] stream error", err.message);
+      if (!this.closed) {
+        this.closed = true;
+        this.stream = null;
+        this.state = "closed";
+        this.failSecure(err);
+        this.options.handlers.onClose(`DHT stream error: ${err.message}`);
+      }
+    });
+
+    // CLI (server) role: emit peer_connected system message immediately so the
+    // upper layer knows a peer arrived and kicks off the handshake.
+    if (this.options.role === "cli") {
+      await this.options.handlers.onSystemMessage({ type: "peer_connected", role: "app" });
+      // CLI waits for client_hello — don't initiate.
+    } else {
+      // App role: initiate handshake
+      this.resetPeerSession();
+      await this.maybeStartHandshake();
+    }
+
+    await this.secureReadyPromise;
+  }
+
+  private async handleParsedJson(raw: SystemMessage | Message | Response | V2HandshakeFrame): Promise<void> {
+    if ("type" in raw) {
+      await this.options.handlers.onSystemMessage(raw);
+      if (raw.type === "peer_connected") {
+        this.resetPeerSession();
+        await this.maybeStartHandshake();
+      } else if (raw.type === "peer_disconnected" || raw.type === "app_disconnected") {
+        this.resetPeerSession();
+      }
+      return;
+    }
+
+    if (isV2HandshakeFrame(raw)) {
+      await this.handleHandshakeFrame(raw);
+      return;
+    }
+
+    throw new Error(
+      this.state === "secure"
+        ? "received plaintext app message after secure transport"
+        : "received plaintext app message before secure transport",
+    );
+  }
+
   async sendMessage(message: Message): Promise<void> {
     const ciphertext = this.encryptEnvelope({ kind: "request", message });
     this.sendBinaryFrame(ciphertext);
@@ -181,11 +318,16 @@ export class V2SessionTransport {
   close(): void {
     this.closed = true;
     this.state = "closed";
-    if (!this.ws) return;
-    if (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING) {
-      this.ws.close();
+    if (this.ws) {
+      if (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING) {
+        this.ws.close();
+      }
+      this.ws = null;
     }
-    this.ws = null;
+    if (this.stream) {
+      try { this.stream.destroy(); } catch { /* ignore */ }
+      this.stream = null;
+    }
   }
 
   isSecure(): boolean {
@@ -196,28 +338,8 @@ export class V2SessionTransport {
     if (!isBinary) {
       const text = typeof data === "string" ? data : Buffer.from(data as ArrayBufferLike).toString("utf-8");
       const raw = JSON.parse(text) as SystemMessage | Message | Response | V2HandshakeFrame;
-
-      if ("type" in raw) {
-        await this.options.handlers.onSystemMessage(raw);
-        if (raw.type === "peer_connected") {
-          this.resetPeerSession();
-          await this.maybeStartHandshake();
-        } else if (raw.type === "peer_disconnected" || raw.type === "app_disconnected") {
-          this.resetPeerSession();
-        }
-        return;
-      }
-
-      if (isV2HandshakeFrame(raw)) {
-        await this.handleHandshakeFrame(raw);
-        return;
-      }
-
-      throw new Error(
-        this.state === "secure"
-          ? "received plaintext app message after secure transport"
-          : "received plaintext app message before secure transport",
-      );
+      await this.handleParsedJson(raw);
+      return;
     }
 
     const bytes = toUint8Array(data);
@@ -360,10 +482,10 @@ export class V2SessionTransport {
         this.remotePublicKey,
         keyPair.privateKey,
       ) as Uint8Array;
-      const payload = JSON.parse(decodeUtf8(opened)) as SessionBootstrapPayload;
+      const payloadParsed = JSON.parse(decodeUtf8(opened)) as SessionBootstrapPayload;
       this.sessionKeys = {
-        rx: sodium.from_base64(payload.c2s, sodium.base64_variants.URLSAFE_NO_PADDING),
-        tx: sodium.from_base64(payload.s2c, sodium.base64_variants.URLSAFE_NO_PADDING),
+        rx: sodium.from_base64(payloadParsed.c2s, sodium.base64_variants.URLSAFE_NO_PADDING),
+        tx: sodium.from_base64(payloadParsed.s2c, sodium.base64_variants.URLSAFE_NO_PADDING),
       };
       const auth = this.computeHandshakeAuth(
         "server_ready",
@@ -398,100 +520,79 @@ export class V2SessionTransport {
     }
   }
 
-  private encryptEnvelope(envelope: EncryptedProtocolEnvelope): Uint8Array {
-    if (this.state !== "secure" || !this.sessionKeys) {
-      throw new Error("secure transport is not active");
+  private sendJsonFrame(value: unknown): void {
+    const text = JSON.stringify(value);
+    if (this.stream) {
+      this.stream.write(encodeStreamFrame(FRAME_TYPE_JSON, Buffer.from(text, "utf-8")));
+    } else if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(text);
     }
+  }
 
-    const nonce = sodium.randombytes_buf(
-      sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES,
-    ) as Uint8Array;
+  private sendBinaryFrame(data: Uint8Array): void {
+    if (this.stream) {
+      this.stream.write(encodeStreamFrame(FRAME_TYPE_BINARY, Buffer.from(data)));
+    } else if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(data);
+    }
+  }
+
+  private encryptEnvelope(envelope: EncryptedProtocolEnvelope): Uint8Array {
+    if (!this.sessionKeys) throw new Error("session keys not established");
+    const nonce = sodium.randombytes_buf(sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES) as Uint8Array;
+    const plaintext = encodeUtf8(JSON.stringify(envelope));
     const ciphertext = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(
-      encodeUtf8(JSON.stringify(envelope)),
+      plaintext,
       null,
       null,
       nonce,
       this.sessionKeys.tx,
     ) as Uint8Array;
-
-    const payload = new Uint8Array(nonce.length + ciphertext.length);
-    payload.set(nonce, 0);
-    payload.set(ciphertext, nonce.length);
-    return payload;
+    return encodeV2EncryptedFrame(new Uint8Array([...nonce, ...ciphertext]));
   }
 
   private ensureKeyPair(): KeyPair {
-    if (this.keyPair) return this.keyPair;
-    const pair = sodium.crypto_box_keypair() as { publicKey: Uint8Array; privateKey: Uint8Array };
-    this.keyPair = {
-      publicKey: pair.publicKey,
-      privateKey: pair.privateKey,
-    };
+    if (!this.keyPair) {
+      this.keyPair = sodium.crypto_box_keypair() as KeyPair;
+    }
     return this.keyPair;
   }
 
   private resetPeerSession(): void {
+    this.keyPair = null;
     this.remotePublicKey = null;
     this.sessionKeys = null;
-    if (this.ws?.readyState === WebSocket.OPEN) {
+    if (this.state !== "closed") {
       this.state = "open";
-    } else {
-      this.state = "idle";
     }
-  }
-
-  private computeHandshakeAuth(
-    phase: "client_key" | "server_ready",
-    senderRole: "cli" | "app",
-    peerPubkeyB64: string,
-    nonce?: Uint8Array,
-    boxed?: Uint8Array,
-  ): string {
-    const authKey = sodium.crypto_generichash(
-      sodium.crypto_auth_KEYBYTES,
-      encodeUtf8(this.options.sessionSecret),
-      undefined,
-    ) as Uint8Array;
-    const parts = [
-      phase,
-      senderRole,
-      peerPubkeyB64,
-      nonce ? sodium.to_base64(nonce, sodium.base64_variants.URLSAFE_NO_PADDING) : "",
-      boxed ? sodium.to_base64(boxed, sodium.base64_variants.URLSAFE_NO_PADDING) : "",
-    ];
-    const tag = sodium.crypto_auth(parts.join(":"), authKey) as Uint8Array;
-    return sodium.to_base64(tag, sodium.base64_variants.URLSAFE_NO_PADDING);
-  }
-
-  private sendJsonFrame(frame: V2HandshakeFrame): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      throw new Error("v2 transport is not connected");
-    }
-    this.ws.send(JSON.stringify(frame));
-  }
-
-  private sendBinaryFrame(ciphertext: Uint8Array): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      throw new Error("v2 transport is not connected");
-    }
-    const framed = encodeV2EncryptedFrame(ciphertext);
-    this.ws.send(framed);
   }
 
   private markSecure(): void {
     this.state = "secure";
-    if (this.secureReadyResolve) {
-      this.secureReadyResolve();
-      this.secureReadyResolve = null;
-      this.secureReadyReject = null;
-    }
+    this.secureReadyResolve?.();
+    this.secureReadyResolve = null;
+    this.secureReadyReject = null;
   }
 
   private failSecure(error: Error): void {
-    if (this.secureReadyReject) {
-      this.secureReadyReject(error);
-      this.secureReadyResolve = null;
-      this.secureReadyReject = null;
-    }
+    this.secureReadyReject?.(error);
+    this.secureReadyResolve = null;
+    this.secureReadyReject = null;
+  }
+
+  private computeHandshakeAuth(
+    kind: string,
+    role: string,
+    pubkey: string,
+    nonce?: Uint8Array,
+    boxed?: Uint8Array,
+  ): string {
+    const secret = encodeUtf8(this.options.sessionSecret ?? this.options.password ?? "");
+    const parts = [kind, role, pubkey];
+    if (nonce) parts.push(sodium.to_base64(nonce, sodium.base64_variants.URLSAFE_NO_PADDING));
+    if (boxed) parts.push(sodium.to_base64(boxed, sodium.base64_variants.URLSAFE_NO_PADDING));
+    const message = encodeUtf8(parts.join(":"));
+    const mac = sodium.crypto_auth(message, secret.length === 32 ? secret : sodium.crypto_generichash(32, secret)) as Uint8Array;
+    return sodium.to_base64(mac, sodium.base64_variants.URLSAFE_NO_PADDING);
   }
 }

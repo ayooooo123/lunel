@@ -53,6 +53,7 @@
     "@expo-google-fonts/space-grotesk": "^0.4.1",
     "@expo/vector-icons": "^15.0.3",
     "@hot-updater/react-native": "latest",
+    "@hyperswarm/dht-relay": "^0.4.3",
     "@lezer/highlight": "^1.2.3",
     "@lobehub/icons": "^5.0.1",
     "@lobehub/icons-rn": "^2.4.0",

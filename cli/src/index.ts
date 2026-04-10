@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { WebSocket } from "ws";
+import { WebSocket, WebSocketServer } from "ws";
 import qrcode from "qrcode-terminal";
 import shell from "shelljs";
 import { createAiManager } from "./ai/index.js";
@@ -8,6 +8,12 @@ import type { AiManager, AiBackend } from "./ai/index.js";
 import type { Message, Response } from "./transport/protocol.js";
 import { V2SessionTransport } from "./transport/v2.js";
 import Ignore from "ignore";
+import { createRequire as _createRequire } from "module";
+const _require = _createRequire(import.meta.url);
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const DHT = _require("hyperdht") as any;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const b4a = _require("b4a") as any;
 const ignore = Ignore.default;
 type IgnoreInstance = ReturnType<typeof ignore>;
 import * as fs from "fs/promises";
@@ -19,8 +25,17 @@ import { spawn, spawnSync, ChildProcess, execSync } from "child_process";
 import { createServer, createConnection, Socket } from "net";
 import { createInterface } from "readline";
 
-const DEFAULT_PROXY_URL = normalizeGatewayUrl(process.env.LUNEL_PROXY_URL || "https://gateway.lunel.dev");
-const MANAGER_URL = normalizeGatewayUrl(process.env.LUNEL_MANAGER_URL || "https://manager.lunel.dev");
+// Holesail mode: no centralized gateway or manager needed.
+// Keep these for legacy fallback if LUNEL_GATEWAY env var is explicitly set.
+const LEGACY_GATEWAY = process.env.LUNEL_PROXY_URL ? normalizeGatewayUrl(process.env.LUNEL_PROXY_URL) : null;
+const DEFAULT_PROXY_URL = LEGACY_GATEWAY ?? "https://gateway.lunel.dev";
+const MANAGER_URL = process.env.LUNEL_MANAGER_URL ? normalizeGatewayUrl(process.env.LUNEL_MANAGER_URL) : "https://manager.lunel.dev";
+
+// HyperDHT state for P2P mode
+let dhtNode: any = null;
+let dhtServer: any = null;
+let localProxyWsServer: WebSocketServer | null = null;
+let localProxyWsPort = 0;
 const CLI_ARGS = process.argv.slice(2);
 function hasAnyFlag(args: string[], ...flags: string[]): boolean {
   return flags.some((flag) => args.includes(flag));
@@ -2486,15 +2501,20 @@ async function handleProxyConnect(payload: Record<string, unknown>): Promise<Rec
   }
   debugLog("[proxy] local tcp connected", { tunnelId, port });
 
-  // 2. Open proxy WebSocket to gateway
-  const wsBase = activeGatewayUrl.replace(/^https:/, "wss:");
-  if (!wsBase.startsWith("wss://")) {
-    throw Object.assign(new Error("Gateway URL must use https://"), { code: "EPROTO" });
+  // 2. Open proxy WebSocket — in P2P mode use local WS server, else use gateway
+  let proxyWsUrl: string;
+  if (localProxyWsPort > 0) {
+    proxyWsUrl = `ws://127.0.0.1:${localProxyWsPort}/v1/ws/proxy?tunnelId=${encodeURIComponent(tunnelId)}&role=cli`;
+  } else {
+    const wsBase = activeGatewayUrl.replace(/^https:/, "wss:");
+    if (!wsBase.startsWith("wss://")) {
+      throw Object.assign(new Error("Gateway URL must use https://"), { code: "EPROTO" });
+    }
+    const authQuery = currentSessionPassword
+      ? `password=${encodeURIComponent(currentSessionPassword)}`
+      : `code=${encodeURIComponent(currentSessionCode as string)}`;
+    proxyWsUrl = `${wsBase}/v1/ws/proxy?${authQuery}&tunnelId=${encodeURIComponent(tunnelId)}&role=cli`;
   }
-  const authQuery = currentSessionPassword
-    ? `password=${encodeURIComponent(currentSessionPassword)}`
-    : `code=${encodeURIComponent(currentSessionCode as string)}`;
-  const proxyWsUrl = `${wsBase}/v1/ws/proxy?${authQuery}&tunnelId=${encodeURIComponent(tunnelId)}&role=cli`;
   debugLog("[proxy] connecting cli proxy websocket", {
     tunnelId,
     port,
@@ -3349,6 +3369,19 @@ function gracefulShutdown(): void {
   processes.clear();
   processOutputBuffers.clear();
   cleanupAllTunnels();
+  // P2P cleanup
+  if (localProxyWsServer) {
+    localProxyWsServer.close();
+    localProxyWsServer = null;
+  }
+  if (dhtServer) {
+    void dhtServer.close().catch(() => {});
+    dhtServer = null;
+  }
+  if (dhtNode) {
+    void dhtNode.destroy().catch(() => {});
+    dhtNode = null;
+  }
   process.exit(0);
 }
 
@@ -3384,6 +3417,169 @@ function startAiManagerInBackground(): void {
   })();
 }
 
+// ── P2P: start local proxy WS server ────────────────────────────────────────
+// The app connects its proxy tunnels here via the DHT tunnel instead of going
+// to gateway.lunel.dev. Each WS connection from the app carries a tunnelId
+// query param; we pair it with the pending tunnel from handleProxyConnect.
+
+const pendingProxyCliSockets = new Map<string, { resolve: (ws: WebSocket) => void; reject: (e: Error) => void }>();
+
+function startLocalProxyWsServer(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const wss = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    wss.on("error", reject);
+    wss.on("listening", () => {
+      const addr = wss.address() as { port: number };
+      localProxyWsPort = addr.port;
+      localProxyWsServer = wss;
+      resolve(addr.port);
+    });
+
+    wss.on("connection", (ws, req) => {
+      const url = new URL(req.url ?? "/", "http://localhost");
+      const tunnelId = url.searchParams.get("tunnelId") ?? "";
+      const pending = pendingProxyCliSockets.get(tunnelId);
+      if (!pending) {
+        ws.close(1008, "unknown tunnelId");
+        return;
+      }
+      pendingProxyCliSockets.delete(tunnelId);
+      pending.resolve(ws);
+    });
+  });
+}
+
+// Override handleProxyConnect's WS connection to use the pending socket map
+// when in P2P mode. The app's proxyServer connects to the Holesail-tunneled
+// local WS server, which delivers the WS here.
+const _origConnectProxyWs = async (proxyWsUrl: string, tunnelId: string): Promise<WebSocket> => {
+  if (localProxyWsPort > 0) {
+    // P2P: wait for the app side to connect back via the local WS server
+    return new Promise<WebSocket>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pendingProxyCliSockets.delete(tunnelId);
+        reject(Object.assign(new Error("Proxy WS connect timeout (P2P)"), { code: "ETIMEOUT" }));
+      }, PROXY_WS_CONNECT_TIMEOUT_MS);
+
+      pendingProxyCliSockets.set(tunnelId, {
+        resolve: (ws) => { clearTimeout(timer); resolve(ws); },
+        reject: (e) => { clearTimeout(timer); reject(e); },
+      });
+    });
+  }
+
+  // Legacy gateway mode
+  return new Promise<WebSocket>((resolve, reject) => {
+    const ws = new WebSocket(proxyWsUrl);
+    const timeout = setTimeout(() => {
+      ws.close();
+      reject(Object.assign(new Error("Proxy WS connect timeout"), { code: "ETIMEOUT" }));
+    }, PROXY_WS_CONNECT_TIMEOUT_MS);
+
+    ws.on("open", () => { clearTimeout(timeout); resolve(ws); });
+    ws.on("error", (err) => { clearTimeout(timeout); reject(err); });
+    ws.on("close", () => { clearTimeout(timeout); reject(new Error("Proxy WS closed during connect")); });
+  });
+};
+
+// ── V2 transport handlers (shared between WS and stream modes) ───────────────
+function makeV2Handlers(onClose: (reason: string) => void): import("./transport/v2.js").V2TransportHandlers {
+  return {
+    onSystemMessage: async (message) => {
+      if (message.type === "connected") return;
+
+      if (message.type === "peer_connected") {
+        console.log("App connected!\n");
+        void publishDiscoveredPorts(true);
+        return;
+      }
+
+      if (message.type === "peer_disconnected") {
+        console.log("App disconnected. Waiting for reconnect window.\n");
+        stopPortSync();
+        return;
+      }
+
+      if (message.type === "app_disconnected") {
+        if (message.reconnectDeadline) {
+          console.log(`[session] app disconnected, waiting until ${new Date(message.reconnectDeadline).toISOString()}`);
+        }
+        return;
+      }
+
+      if (message.type === "close_connection") {
+        const reason = message.reason || "expired";
+        console.log(`[session] closed by gateway: ${reason}`);
+        if (reason === "session ended from app") {
+          console.log("[session] Run `npx lunel-cli` again and scan the new QR code to reconnect.");
+        }
+        gracefulShutdown();
+      }
+    },
+    onProtocolRequest: async (message) => {
+      return await processMessage(message);
+    },
+    onProtocolResponse: async () => {},
+    onProtocolEvent: async (message) => {
+      await processMessage(message);
+    },
+    onClose,
+  };
+}
+
+// ── P2P: start HyperDHT server ───────────────────────────────────────────────
+async function startDhtServer(seedHex: string | null): Promise<{ keyHex: string; seedHex: string }> {
+  dhtNode = new DHT();
+  await dhtNode.ready();
+
+  let seed: Buffer;
+  if (seedHex) {
+    seed = Buffer.from(seedHex, "hex");
+  } else {
+    seed = DHT.keyPair().secretKey.slice(0, 32); // random seed
+  }
+
+  const keyPair = DHT.keyPair(seed);
+
+  dhtServer = dhtNode.createServer(async (conn: any) => {
+    if (shuttingDown) { conn.destroy(); return; }
+    console.log("App connecting via P2P...");
+
+    const transport = new V2SessionTransport({
+      role: "cli",
+      sessionSecret: b4a.toString(keyPair.publicKey, "hex"),
+      debugLog: DEBUG_MODE ? debugLog : undefined,
+      handlers: makeV2Handlers((reason) => {
+        if (shuttingDown) return;
+        stopPortSync();
+        cleanupAllTunnels();
+        activeV2Transport = null;
+        console.log(`\nP2P connection closed: ${reason}`);
+        // In P2P mode the app just reconnects by scanning the same key
+      }),
+    });
+
+    activeV2Transport = transport;
+    startPortSync();
+
+    try {
+      await transport.connectStream(conn);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!shuttingDown) console.error(`[p2p] transport error: ${msg}`);
+      activeV2Transport = null;
+      stopPortSync();
+    }
+  });
+
+  await dhtServer.listen(keyPair);
+
+  return {
+    keyHex: b4a.toString(keyPair.publicKey, "hex"),
+    seedHex: b4a.toString(seed, "hex"),
+  };
+}
+
 async function connectWebSocketV2(): Promise<void> {
   const gatewayUrl = currentPrimaryGateway;
   if (!currentSessionPassword) {
@@ -3400,58 +3596,16 @@ async function connectWebSocketV2(): Promise<void> {
     generation: currentReattachGeneration,
     role: "cli",
     debugLog: DEBUG_MODE ? debugLog : undefined,
-    handlers: {
-      onSystemMessage: async (message) => {
-        if (message.type === "connected") return;
-
-        if (message.type === "peer_connected") {
-          console.log("App connected!\n");
-          void publishDiscoveredPorts(true);
-          return;
-        }
-
-        if (message.type === "peer_disconnected") {
-          console.log("App disconnected. Waiting for reconnect window.\n");
-          stopPortSync();
-          return;
-        }
-
-        if (message.type === "app_disconnected") {
-          if (message.reconnectDeadline) {
-            console.log(`[session] app disconnected, waiting until ${new Date(message.reconnectDeadline).toISOString()}`);
-          }
-          return;
-        }
-
-        if (message.type === "close_connection") {
-          const reason = message.reason || "expired";
-          console.log(`[session] closed by gateway: ${reason}`);
-          if (reason === "session ended from app") {
-            console.log("[session] Run `npx lunel-cli` again and scan the new QR code to reconnect.");
-          }
-          gracefulShutdown();
-        }
-      },
-      onProtocolRequest: async (message) => {
-        return await processMessage(message);
-      },
-      onProtocolResponse: async () => {
-        // CLI does not currently await app responses outside request/reply routing.
-      },
-      onProtocolEvent: async (message) => {
-        await processMessage(message);
-      },
-      onClose: (reason) => {
+    handlers: makeV2Handlers((reason) => {
+      if (shuttingDown) return;
+      stopPortSync();
+      cleanupAllTunnels();
+      activeV2Transport = null;
+      setTimeout(() => {
         if (shuttingDown) return;
-        stopPortSync();
-        cleanupAllTunnels();
-        activeV2Transport = null;
-        setTimeout(() => {
-          if (shuttingDown) return;
-          void handleConnectionDrop(reason);
-        }, 50);
-      },
-    },
+        void handleConnectionDrop(reason);
+      }, 50);
+    }),
   });
 
   activeV2Transport = transport;
@@ -3496,16 +3650,16 @@ async function main(): Promise<void> {
     return;
   }
 
-  console.log("Lunel CLI v" + VERSION);
+  console.log("Lunel CLI v" + VERSION + " (P2P/Holesail mode)");
   console.log("=".repeat(20) + "\n");
   if (EXTRA_PORTS.length > 0) {
     console.log(`Extra ports enabled: ${EXTRA_PORTS.join(", ")}`);
   }
 
-  let usedSavedSession = false;
   try {
     const cliConfig = await getCliConfig();
     const savedSession = getSavedSessionForRoot(cliConfig, ROOT_DIR);
+
     debugLog("Checking PTY runtime...");
     const ptyBinaryPath = await ensurePtyBinaryReady();
     if (ptyBinaryPath) {
@@ -3514,54 +3668,40 @@ async function main(): Promise<void> {
       debugLog(`PTY runtime unsupported on ${os.platform()}/${os.arch()}. Skipping prefetch.\n`);
     }
 
-    // Start AI backends in the background so missing or slow AI runtimes never
-    // block QR/session startup for the rest of the CLI.
     startAiManagerInBackground();
 
-    let sessionCodeToUse: string | null = null;
-    let sessionPasswordToUse: string;
+    // Start local proxy WS server (the app connects proxy tunnels here via DHT)
+    await startLocalProxyWsServer();
+    debugLog(`[p2p] local proxy WS server listening on port ${localProxyWsPort}`);
 
+    // Reuse saved DHT seed so the key stays the same across restarts
+    let savedSeedHex: string | null = null;
     if (!FORCE_NEW_CODE && savedSession) {
-      console.log(`Using saved session for ${ROOT_DIR}`);
+      // We store the seed in sessionPassword field for P2P sessions
+      savedSeedHex = savedSession.sessionPassword;
+      console.log(`Using saved P2P session for ${ROOT_DIR}`);
       displaySavedSessionNotice();
-      sessionCodeToUse = savedSession.sessionCode;
-      sessionPasswordToUse = savedSession.sessionPassword;
-      usedSavedSession = true;
     } else {
       if (FORCE_NEW_CODE && savedSession?.sessionPassword) {
-        await revokePassword(savedSession.sessionPassword);
         await clearSavedSessionForRoot();
       }
-      const qr = await createQrCode();
-      currentSessionCode = qr.code;
-      displayQR(qr.code);
-      const assembled = await assembleWithCode(qr.code);
-      sessionCodeToUse = assembled.code;
-      sessionPasswordToUse = assembled.password;
-      await saveSessionForRoot(sessionCodeToUse, sessionPasswordToUse);
     }
 
-    currentSessionCode = sessionCodeToUse;
-    currentSessionPassword = sessionPasswordToUse;
-    if (usedSavedSession) {
-      const reattach = await claimReattach(sessionPasswordToUse);
-      currentPrimaryGateway = reattach.proxyUrl;
-      currentReattachGeneration = reattach.generation;
-    } else {
-      currentPrimaryGateway = await getAssignedProxyUrl(sessionPasswordToUse);
-      currentReattachGeneration = null;
-    }
-    activeGatewayUrl = currentPrimaryGateway;
+    // Start HyperDHT server
+    console.log("Starting P2P server...");
+    const { keyHex, seedHex } = await startDhtServer(savedSeedHex);
+    currentSessionCode = keyHex;
 
-    await connectWebSocketV2();
+    // Save the seed so the key persists across restarts
+    await saveSessionForRoot(keyHex, seedHex);
+
+    // Display the DHT public key as QR code for the app to scan
+    displayQR(keyHex);
+    console.log("  Waiting for app to connect via P2P (HyperDHT)...\n");
+    console.log("  No server required — connection is fully peer-to-peer.\n");
+
+    // Keep running — the DHT server handles incoming connections
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (
-      usedSavedSession &&
-      /invalid|revoked|not found|expired|password invalid|password revoked/i.test(message)
-    ) {
-      await clearSavedSessionForRoot().catch(() => {});
-    }
     if (error instanceof Error) {
       console.error(`Error: ${error.message}`);
       if (DEBUG_MODE && error.stack) console.error(error.stack);
